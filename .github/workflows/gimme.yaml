@@ -1,74 +1,242 @@
-name: CTF – GITHUB_TOKEN capabilities (safe)
+name: GH Token Capabilities – Kitchen Sink (safe by default)
 
 on:
   workflow_dispatch:
+    inputs:
+      do_issue:
+        description: "Create & close a throwaway issue"
+        type: boolean
+        default: true
+      do_contents_write:
+        description: "Create a temp file on a temp branch, PR it, then clean up"
+        type: boolean
+        default: true
+      do_release:
+        description: "Create a draft release (and delete it)"
+        type: boolean
+        default: false
+      do_statuses:
+        description: "Set a commit status on current SHA"
+        type: boolean
+        default: true
+      do_checks:
+        description: "Create a check run (pending -> success)"
+        type: boolean
+        default: true
+      do_deployment:
+        description: "Create a deployment & mark it inactive"
+        type: boolean
+        default: true
+      do_actions_dispatch:
+        description: "Dispatch another workflow file in this repo (needs existing file)"
+        type: boolean
+        default: false
+      actions_dispatch_workflow_file:
+        description: "File name under .github/workflows (e.g., build.yml)"
+        required: false
+        default: ""
+      do_artifact:
+        description: "Upload a small artifact"
+        type: boolean
+        default: true
+      do_oidc:
+        description: "Request an OIDC ID token (id-token:write)"
+        type: boolean
+        default: true
+      do_sarif:
+        description: "Upload a tiny synthetic SARIF to Code Scanning (non-destructive)"
+        type: boolean
+        default: true
 
-# Grant broad permissions for this workflow run (repo-scoped).
-# GitHub supports the convenience flags read-all / write-all.
-# Any scope you don't list becomes "none".
-permissions: write-all
+# Maximal repo-scoped permissions for demonstration
+# (Use only in a lab / CTF repo.)
+permissions:
+  contents: write
+  issues: write
+  pull-requests: write
+  actions: write
+  checks: write
+  deployments: write
+  statuses: write
+  security-events: write
+  packages: write
+  id-token: write
 
 jobs:
-  token-capabilities:
+  demo:
     runs-on: ubuntu-latest
     env:
-      # Hand the runtime token to tools as GH_TOKEN (do NOT echo it)
       GH_TOKEN: ${{ github.token }}
-      OWNER: ${{ github.repository_owner }}
-      REPO: ${{ github.event.repository.name || github.repository }}
       API: https://api.github.com
+      OWNER_REPO: ${{ github.repository }}
+      SHA: ${{ github.sha }}
+      ACTOR: ${{ github.actor }}
 
     steps:
-      - name: Show context (safe)
-        run: |
-          echo "Repo: $REPO"
-          echo "Actor: $GITHUB_ACTOR"
-          echo "Run ID: $GITHUB_RUN_ID"
-          echo "Token length (chars, safe):" $(printf "%s" "$GH_TOKEN" | wc -c)
+      - name: Checkout (not strictly needed but handy)
+        uses: actions/checkout@v4
 
-      - name: Prove token works (rate limit & identity) – non-destructive
+      - name: Show identity & rate limit (safe)
         run: |
+          set -euo pipefail
+          echo "Repo: $OWNER_REPO"
+          echo "Actor: $ACTOR"
+          echo "Run ID: $GITHUB_RUN_ID"
+          echo "Token length:" $(printf "%s" "$GH_TOKEN" | wc -c)
           curl -sS -H "authorization: Bearer $GH_TOKEN" -H "accept: application/vnd.github+json" \
-            $API/rate_limit | jq '.resources.core.remaining,.resources.core.reset'
+            $API/user | jq '{login, type}'
           curl -sS -H "authorization: Bearer $GH_TOKEN" -H "accept: application/vnd.github+json" \
-            $API/user | jq '.login,.type'
+            $API/rate_limit | jq '.resources.core'
 
       - name: Read repo metadata (contents:read)
         run: |
           curl -sS -H "authorization: Bearer $GH_TOKEN" -H "accept: application/vnd.github+json" \
-            $API/repos/${{ github.repository }} | jq '{full_name, private, default_branch}'
+            $API/repos/$OWNER_REPO | jq '{full_name, private, default_branch}'
 
-      - name: Create and close a throwaway issue (issues:write)
+      - name: Create & close a throwaway issue (issues:write)
+        if: ${{ inputs.do_issue }}
+        id: issue
         run: |
-          NUMBER=$(curl -sS -X POST -H "authorization: Bearer $GH_TOKEN" -H "accept: application/vnd.github+json" \
-            $API/repos/${{ github.repository }}/issues \
-            -d '{"title":"CTF probe – please ignore","body":"Created by workflow to demonstrate token scope."}' | jq -r '.number')
-          echo "Issue #$NUMBER created"
+          set -euo pipefail
+          NUM=$(curl -sS -X POST -H "authorization: Bearer $GH_TOKEN" -H "accept: application/vnd.github+json" \
+            $API/repos/$OWNER_REPO/issues \
+            -d '{"title":"CTF probe – please ignore","body":"Created by workflow to demonstrate token scope."}' \
+            | jq -r '.number')
+          echo "number=$NUM" >> $GITHUB_OUTPUT
           curl -sS -X PATCH -H "authorization: Bearer $GH_TOKEN" -H "accept: application/vnd.github+json" \
-            $API/repos/${{ github.repository }}/issues/$NUMBER -d '{"state":"closed"}' >/dev/null
-          echo "Issue #$NUMBER closed"
+            $API/repos/$OWNER_REPO/issues/$NUM -d '{"state":"closed"}' >/dev/null
+          echo "Issue #$NUM closed"
 
-      - name: Create and delete a temporary branch file (contents:write)
+      - name: Contents write on temp branch + PR (contents:write, pull-requests:write)
+        if: ${{ inputs.do_contents_write }}
+        id: pr
         run: |
-          BR="${GITHUB_REF_NAME:-main}"
+          set -euo pipefail
+          DEF=$(curl -sS -H "authorization: Bearer $GH_TOKEN" $API/repos/$OWNER_REPO | jq -r '.default_branch')
           TS=$(date -u +%Y%m%d%H%M%S)
-          PATHNAME=".ctf-probe-$TS.txt"
+          BR="ctf-probe-$TS"
+          FILE=".ctf-probe-$TS.txt"
           MSG="CTF probe $(date -u)"
           CONTENT=$(printf "%s\n" "$MSG" | base64 -w0)
-          # create file
-          curl -sS -X PUT -H "authorization: Bearer $GH_TOKEN" -H "accept: application/vnd.github+json" \
-            "$API/repos/${{ github.repository }}/contents/$PATHNAME" \
-            -d "{\"message\":\"add $PATHNAME\",\"content\":\"$CONTENT\",\"branch\":\"$BR\"}" | jq '{content:{path,sha}}' | tee created.json
-          SHA=$(jq -r '.content.sha' created.json)
-          # delete file
-          curl -sS -X DELETE -H "authorization: Bearer $GH_TOKEN" -H "accept: application/vnd.github+json" \
-            "$API/repos/${{ github.repository }}/contents/$PATHNAME" \
-            -d "{\"message\":\"remove $PATHNAME\",\"sha\":\"$SHA\",\"branch\":\"$BR\"}" >/dev/null
-          echo "Created and removed $PATHNAME on $BR"
 
-      - name: Dispatch another workflow (actions:write) – optional
-        if: ${{ false }} # flip to true after you add a target workflow file
+          BASE_SHA=$(curl -sS -H "authorization: Bearer $GH_TOKEN" $API/repos/$OWNER_REPO/git/refs/heads/$DEF | jq -r '.object.sha')
+          # create temp branch
+          curl -sS -X POST -H "authorization: Bearer $GH_TOKEN" -H "accept: application/vnd.github+json" \
+            $API/repos/$OWNER_REPO/git/refs -d "{\"ref\":\"refs/heads/$BR\",\"sha\":\"$BASE_SHA\"}" >/dev/null
+
+          # add a file via Contents API
+          curl -sS -X PUT -H "authorization: Bearer $GH_TOKEN" -H "accept: application/vnd.github+json" \
+            $API/repos/$OWNER_REPO/contents/$FILE \
+            -d "{\"message\":\"add $FILE\",\"content\":\"$CONTENT\",\"branch\":\"$BR\"}" | jq '{content:{path,sha}}'
+
+          # open PR
+          PR=$(curl -sS -X POST -H "authorization: Bearer $GH_TOKEN" -H "accept: application/vnd.github+json" \
+            $API/repos/$OWNER_REPO/pulls \
+            -d "{\"title\":\"CTF probe PR $TS\",\"head\":\"$BR\",\"base\":\"$DEF\",\"body\":\"Auto PR from kitchen sink demo.\"}" \
+            | jq -r '.number')
+          echo "number=$PR" >> $GITHUB_OUTPUT
+          echo "Opened PR #$PR"
+
+          # close PR (no merge) and delete branch
+          curl -sS -X PATCH -H "authorization: Bearer $GH_TOKEN" -H "accept: application/vnd.github+json" \
+            $API/repos/$OWNER_REPO/pulls/$PR -d '{"state":"closed"}' >/dev/null
+          curl -sS -X DELETE -H "authorization: Bearer $GH_TOKEN" $API/repos/$OWNER_REPO/git/refs/heads/$BR >/dev/null || true
+          echo "Closed PR #$PR and deleted $BR"
+
+      - name: Draft release create & delete (releases:write via contents)
+        if: ${{ inputs.do_release }}
+        run: |
+          set -euo pipefail
+          TAG="ctf-probe-$(date -u +%Y%m%d%H%M%S)"
+          REL=$(curl -sS -X POST -H "authorization: Bearer $GH_TOKEN" -H "accept: application/vnd.github+json" \
+             $API/repos/$OWNER_REPO/releases \
+             -d "{\"tag_name\":\"$TAG\",\"name\":\"CTF Probe $TAG\",\"draft\":true,\"prerelease\":false}" )
+          ID=$(printf "%s" "$REL" | jq -r '.id')
+          echo "Draft release id: $ID"
+          curl -sS -X DELETE -H "authorization: Bearer $GH_TOKEN" $API/repos/$OWNER_REPO/releases/$ID >/dev/null
+          echo "Deleted draft release $ID"
+
+      - name: Set a commit status (statuses:write)
+        if: ${{ inputs.do_statuses }}
         run: |
           curl -sS -X POST -H "authorization: Bearer $GH_TOKEN" -H "accept: application/vnd.github+json" \
-            "$API/repos/${{ github.repository }}/actions/workflows/other.yml/dispatches" \
-            -d '{"ref":"main"}'
+            $API/repos/$OWNER_REPO/statuses/$SHA \
+            -d '{"state":"success","context":"ctf/probe","description":"Demo green light","target_url":"https://github.com"}' | jq '{state, context}'
+
+      - name: Create a check run (checks:write)
+        if: ${{ inputs.do_checks }}
+        run: |
+          set -euo pipefail
+          APP=$(curl -sS -H "authorization: Bearer $GH_TOKEN" $API/app | jq -r '.slug // "github-actions"')
+          CR=$(curl -sS -X POST -H "authorization: Bearer $GH_TOKEN" -H "accept: application/vnd.github+json" \
+            $API/repos/$OWNER_REPO/check-runs \
+            -d "{\"name\":\"CTF Check\",\"head_sha\":\"$SHA\",\"status\":\"in_progress\",\"output\":{\"title\":\"CTF Check\",\"summary\":\"Starting\"}}" \
+            | jq -r '.id')
+          echo "Check run id: $CR"
+          sleep 2
+          curl -sS -X PATCH -H "authorization: Bearer $GH_TOKEN" -H "accept: application/vnd.github+json" \
+            $API/repos/$OWNER_REPO/check-runs/$CR \
+            -d '{"status":"completed","conclusion":"success","output":{"title":"CTF Check","summary":"All good"}}' | jq '{status, conclusion}'
+
+      - name: Create deployment & set status (deployments:write)
+        if: ${{ inputs.do_deployment }}
+        run: |
+          set -euo pipefail
+          DEP=$(curl -sS -X POST -H "authorization: Bearer $GH_TOKEN" -H "accept: application/vnd.github+json" \
+            $API/repos/$OWNER_REPO/deployments \
+            -d '{"ref":"'"$SHA"'","environment":"ctf-probe","auto_merge":false,"required_contexts":[]}' | jq -r '.id')
+          echo "Deployment id: $DEP"
+          curl -sS -X POST -H "authorization: Bearer $GH_TOKEN" -H "accept: application/vnd.github+json" \
+            $API/repos/$OWNER_REPO/deployments/$DEP/statuses \
+            -d '{"state":"inactive","log_url":"https://github.com","environment":"ctf-probe"}' | jq '{state, environment}'
+
+      - name: Dispatch another workflow in this repo (actions:write)
+        if: ${{ inputs.do_actions_dispatch && inputs.actions_dispatch_workflow_file != '' }}
+        run: |
+          curl -sS -X POST -H "authorization: Bearer $GH_TOKEN" -H "accept: application/vnd.github+json" \
+            "$API/repos/$OWNER_REPO/actions/workflows/${{ inputs.actions_dispatch_workflow_file }}/dispatches" \
+            -d '{"ref":"${{ github.ref_name }}"}'
+          echo "Dispatched ${{ inputs.actions_dispatch_workflow_file }}"
+
+      - name: Upload a tiny artifact (actions:write via toolkit)
+        if: ${{ inputs.do_artifact }}
+        run: |
+          date -u > proof.txt
+        # Using the official upload-artifact action
+      - uses: actions/upload-artifact@v4
+        if: ${{ inputs.do_artifact }}
+        with:
+          name: ctf-proof
+          path: proof.txt
+
+      - name: Request an OIDC ID token (id-token:write)
+        if: ${{ inputs.do_oidc }}
+        env:
+          REQ_URL: ${{ env.ACTIONS_ID_TOKEN_REQUEST_URL }}
+          REQ_TOKEN: ${{ env.ACTIONS_ID_TOKEN_REQUEST_TOKEN }}
+        run: |
+          set -euo pipefail
+          if [ -z "${REQ_URL:-}" ] || [ -z "${REQ_TOKEN:-}" ]; then
+            echo "OIDC not available"; exit 0
+          fi
+          AUD="repo:${OWNER_REPO}"
+          OIDC=$(curl -sS -H "Authorization: Bearer $REQ_TOKEN" "$REQ_URL&audience=$AUD")
+          # Print only header fields to avoid leaking the token
+          printf "OIDC token header: "
+          printf "%s" "$OIDC" | jq -r '.value' | cut -d. -f1 | base64 -d 2>/dev/null | jq '{alg, kid, typ}'
+
+      - name: Upload a synthetic SARIF (security-events:write)
+        if: ${{ inputs.do_sarif }}
+        run: |
+          set -euo pipefail
+          cat > mini.sarif <<'SARIF'
+          {
+            "version":"2.1.0",
+            "$schema":"https://json.schemastore.org/sarif-2.1.0.json",
+            "runs":[{"tool":{"driver":{"name":"ctf-probe","version":"1.0"}},"results":[]}]
+          }
+          SARIF
+          curl -sS -X POST -H "authorization: Bearer $GH_TOKEN" -H "accept: application/sarif+json" \
+            -H "content-type: application/sarif+json" \
+            "$API/repos/$OWNER_REPO/code-scanning/sarifs" \
+            --data-binary @mini.sarif | jq '{id, url}'
