@@ -1,0 +1,77 @@
+name: CTF – GITHUB_TOKEN capabilities (safe)
+
+on:
+  workflow_dispatch:
+
+# Grant broad permissions for this workflow run (repo-scoped).
+# GitHub supports the convenience flags read-all / write-all.
+# Any scope you don't list becomes "none".
+permissions: write-all
+
+jobs:
+  token-capabilities:
+    runs-on: ubuntu-latest
+    env:
+      # Hand the runtime token to tools as GH_TOKEN (do NOT echo it)
+      GH_TOKEN: ${{ github.token }}
+      OWNER: ${{ github.repository_owner }}
+      REPO: ${{ github.event.repository.name || github.repository }}
+      API: https://api.github.com
+
+    steps:
+      - name: Show context (safe)
+        run: |
+          echo "Repo: $REPO"
+          echo "Actor: $GITHUB_ACTOR"
+          echo "Run ID: $GITHUB_RUN_ID"
+          echo "Token length (chars, safe):" $(printf "%s" "$GH_TOKEN" | wc -c)
+
+      - name: Sleep for 5 minutes to prove token is still valid after delay
+        run: sleep 300
+
+      - name: Prove token works (rate limit & identity) – non-destructive
+        run: |
+          curl -sS -H "authorization: Bearer $GH_TOKEN" -H "accept: application/vnd.github+json" \
+            $API/rate_limit | jq '.resources.core.remaining,.resources.core.reset'
+          curl -sS -H "authorization: Bearer $GH_TOKEN" -H "accept: application/vnd.github+json" \
+            $API/user | jq '.login,.type'
+
+      - name: Read repo metadata (contents:read)
+        run: |
+          curl -sS -H "authorization: Bearer $GH_TOKEN" -H "accept: application/vnd.github+json" \
+            $API/repos/${{ github.repository }} | jq '{full_name, private, default_branch}'
+
+      - name: Create and close a throwaway issue (issues:write)
+        run: |
+          NUMBER=$(curl -sS -X POST -H "authorization: Bearer $GH_TOKEN" -H "accept: application/vnd.github+json" \
+            $API/repos/${{ github.repository }}/issues \
+            -d '{"title":"CTF probe – please ignore","body":"Created by workflow to demonstrate token scope."}' | jq -r '.number')
+          echo "Issue #$NUMBER created"
+          curl -sS -X PATCH -H "authorization: Bearer $GH_TOKEN" -H "accept: application/vnd.github+json" \
+            $API/repos/${{ github.repository }}/issues/$NUMBER -d '{"state":"closed"}' >/dev/null
+          echo "Issue #$NUMBER closed"
+
+      - name: Create and delete a temporary branch file (contents:write)
+        run: |
+          BR="${GITHUB_REF_NAME:-main}"
+          TS=$(date -u +%Y%m%d%H%M%S)
+          PATHNAME=".ctf-probe-$TS.txt"
+          MSG="CTF probe $(date -u)"
+          CONTENT=$(printf "%s\n" "$MSG" | base64 -w0)
+          # create file
+          curl -sS -X PUT -H "authorization: Bearer $GH_TOKEN" -H "accept: application/vnd.github+json" \
+            "$API/repos/${{ github.repository }}/contents/$PATHNAME" \
+            -d "{\"message\":\"add $PATHNAME\",\"content\":\"$CONTENT\",\"branch\":\"$BR\"}" | jq '{content:{path,sha}}' | tee created.json
+          SHA=$(jq -r '.content.sha' created.json)
+          # delete file
+          curl -sS -X DELETE -H "authorization: Bearer $GH_TOKEN" -H "accept: application/vnd.github+json" \
+            "$API/repos/${{ github.repository }}/contents/$PATHNAME" \
+            -d "{\"message\":\"remove $PATHNAME\",\"sha\":\"$SHA\",\"branch\":\"$BR\"}" >/dev/null
+          echo "Created and removed $PATHNAME on $BR"
+
+      - name: Dispatch another workflow (actions:write) – optional
+        if: ${{ false }} # flip to true after you add a target workflow file
+        run: |
+          curl -sS -X POST -H "authorization: Bearer $GH_TOKEN" -H "accept: application/vnd.github+json" \
+            "$API/repos/${{ github.repository }}/actions/workflows/other.yml/dispatches" \
+            -d '{"ref":"main"}'
