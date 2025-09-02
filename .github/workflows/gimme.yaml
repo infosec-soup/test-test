@@ -26,9 +26,6 @@ jobs:
           echo "Run ID: $GITHUB_RUN_ID"
           echo "Token length (chars, safe):" $(printf "%s" "$GH_TOKEN" | wc -c)
 
-      - name: Sleep for 5 minutes to prove token is still valid after delay
-        run: sleep 300
-
       - name: Prove token works (rate limit & identity) – non-destructive
         run: |
           curl -sS -H "authorization: Bearer $GH_TOKEN" -H "accept: application/vnd.github+json" \
